@@ -7,6 +7,8 @@ struct PVSParams {
     bool use_eval_mobility = true;
     bool use_quiescence    = true;
     bool report_partial    = true;
+    bool use_tt            = true;
+    bool use_move_ordering = true;
 
     static PVSParams from_map(const ParamMap& m){
         PVSParams p;
@@ -14,6 +16,8 @@ struct PVSParams {
         p.use_eval_mobility = param_bool(m, "UseEvalMobility", true);
         p.use_quiescence    = param_bool(m, "UseQuiescence",   true);
         p.report_partial    = param_bool(m, "ReportPartial",   true);
+        p.use_tt            = param_bool(m, "UseTT",           true);
+        p.use_move_ordering = param_bool(m, "UseMoveOrdering", true);
         return p;
     }
 };
@@ -31,7 +35,6 @@ public:
         const PVSParams& p
     );
 
-    /* Quiescence search — captures only */
     static int quiescence(
         State *state,
         int alpha,

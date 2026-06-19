@@ -1,18 +1,21 @@
 #include <utility>
 #include "state.hpp"
 #include "pvs.hpp"
+#include "search_util.hpp"
+
+
+static KillerTable  g_killers;
+static HistoryTable g_history;
+static TranspositionTable g_tt;
 
 
 /*============================================================
  * PVS — eval_ctx
  *
- * Principal Variation Search (also called NegaScout).
- * Searches the first child with the full [alpha,beta] window.
- * All subsequent children are first searched with a null
- * window [alpha, alpha+1]. If a null-window search beats
- * alpha (a "surprise"), we re-search with the full window.
- * This is correct because the first move is expected to be
- * the best (good move ordering helps a lot here).
+ * Principal Variation Search (NegaScout) with transposition table
+ * and move ordering. First child of every node gets a full-window
+ * search; subsequent children get a null window [alpha, alpha+1]
+ * and are only re-searched with the full window if they beat alpha.
  *============================================================*/
 int PVS::eval_ctx(
     State *state,
@@ -36,7 +39,27 @@ int PVS::eval_ctx(
 
     int rep_score;
     if(state->check_repetition(history, rep_score)) return rep_score;
-    history.push(state->hash());
+
+    uint64_t key = state->hash();
+    int orig_alpha = alpha, orig_beta = beta;
+    Move tt_move{};
+    bool has_tt_move = false;
+
+    if(p.use_tt){
+        const TTEntry* e = g_tt.probe(key);
+        if(e && e->depth >= depth){
+            if(e->flag == TTFlag::EXACT) return e->score;
+            if(e->flag == TTFlag::LOWER && e->score > alpha) alpha = e->score;
+            else if(e->flag == TTFlag::UPPER && e->score < beta) beta = e->score;
+            if(alpha >= beta) return e->score;
+        }
+        if(e && e->has_move){
+            tt_move = e->best_move;
+            has_tt_move = true;
+        }
+    }
+
+    history.push(key);
 
     if(depth <= 0){
         int score;
@@ -45,11 +68,18 @@ int PVS::eval_ctx(
         } else {
             score = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
         }
-        history.pop(state->hash());
+        history.pop(key);
         return score;
     }
 
+    if(p.use_move_ordering){
+        order_moves(state->legal_actions, state, tt_move, has_tt_move,
+                     g_killers, ply, g_history);
+    }
+
     int best_score = M_MAX;
+    Move best_move{};
+    bool has_best_move = false;
     bool first_child = true;
 
     for(auto& action : state->legal_actions){
@@ -60,7 +90,6 @@ int PVS::eval_ctx(
         int score;
 
         if(first_child){
-            // Full-window search on the first (expected best) child
             int raw = eval_ctx(next, depth - 1,
                                same ? alpha : -beta,
                                same ? beta  : -alpha,
@@ -68,7 +97,6 @@ int PVS::eval_ctx(
             score = same ? raw : -raw;
             first_child = false;
         } else {
-            // Null-window search
             int null_alpha = same ? alpha : -(alpha + 1);
             int null_beta  = same ? (alpha + 1) : -alpha;
             int raw = eval_ctx(next, depth - 1,
@@ -76,7 +104,6 @@ int PVS::eval_ctx(
                                history, ply + 1, ctx, p);
             score = same ? raw : -raw;
 
-            // Re-search with full window if null window was beaten
             if(score > alpha && score < beta){
                 raw = eval_ctx(next, depth - 1,
                                same ? alpha : -beta,
@@ -88,12 +115,31 @@ int PVS::eval_ctx(
 
         delete next;
 
-        if(score > best_score) best_score = score;
+        if(score > best_score){
+            best_score = score;
+            best_move = action;
+            has_best_move = true;
+        }
         if(best_score > alpha) alpha = best_score;
-        if(alpha >= beta) break;   // beta cutoff
+        if(alpha >= beta){
+            if(p.use_move_ordering && !is_capture_move(state, action)){
+                g_killers.add(ply, action);
+                g_history.add(state->player, action, depth);
+            }
+            break;
+        }
     }
 
-    history.pop(state->hash());
+    history.pop(key);
+
+    if(p.use_tt){
+        TTFlag flag;
+        if(best_score <= orig_alpha)      flag = TTFlag::UPPER;
+        else if(best_score >= orig_beta)  flag = TTFlag::LOWER;
+        else                               flag = TTFlag::EXACT;
+        g_tt.store(key, depth, best_score, flag, best_move, has_best_move);
+    }
+
     return best_score;
 }
 
@@ -101,10 +147,9 @@ int PVS::eval_ctx(
 /*============================================================
  * PVS — quiescence
  *
- * Called at depth==0 (leaf) when use_quiescence is true.
- * Searches capture moves only until the position is quiet,
- * preventing the horizon effect where a bad trade is hidden
- * just beyond the search depth.
+ * Captures-only search at the horizon to avoid the horizon effect.
+ * Not run through the main TT (separate, simpler concern — entries
+ * here have no "depth" in the iterative-deepening sense).
  *============================================================*/
 int PVS::quiescence(
     State *state,
@@ -118,27 +163,35 @@ int PVS::quiescence(
     ctx.nodes++;
     if(ctx.stop) return 0;
 
-    // Stand-pat: assume we can choose not to capture
     int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
     if(stand_pat >= beta) return beta;
     if(stand_pat > alpha) alpha = stand_pat;
 
-    // Ensure legal actions are generated
     if(state->legal_actions.empty() && state->game_state == UNKNOWN)
         state->get_legal_actions();
 
     if(state->game_state == WIN)  return P_MAX - ply;
     if(state->game_state == DRAW) return 0;
 
-    auto& oppn_board = state->board.board[1 - state->player];
+    /* Order captures by MVV-LVA so the strongest trades are explored
+     * first — helps quiescence converge faster within its node budget. */
+    std::vector<Move> captures;
+    captures.reserve(state->legal_actions.size());
+    for(auto& m : state->legal_actions){
+        if(is_capture_move(state, m)) captures.push_back(m);
+    }
+    std::stable_sort(captures.begin(), captures.end(),
+        [&](const Move& a, const Move& b){
+            int opp = 1 - state->player;
+            auto val = [&](const Move& m){
+                int victim = state->piece_at(opp, (int)m.second.first, (int)m.second.second);
+                int attacker = state->piece_at(state->player, (int)m.first.first, (int)m.first.second);
+                return mvv_lva_value(victim) * 1000 - mvv_lva_value(attacker);
+            };
+            return val(a) > val(b);
+        });
 
-    for(auto& action : state->legal_actions){
-        int to_r = action.second.first;
-        int to_c = action.second.second;
-
-        // Only follow captures (destination has an opponent piece)
-        if(!oppn_board[to_r][to_c]) continue;
-
+    for(auto& action : captures){
         State* next = static_cast<State*>(state->next_state(action));
         next->get_legal_actions();
 
@@ -171,8 +224,26 @@ SearchResult PVS::search(
     SearchResult result;
     result.depth = depth;
 
+    if(p.use_tt && depth <= 1){
+        /* Only clear on the first iterative-deepening call (depth==1)
+         * for this go command, so shallower depths' TT entries continue
+         * to seed move ordering for deeper ones within the same search. */
+        g_tt.clear();
+    }
+    g_killers.clear();
+    g_history.clear();
+
     if(!state->legal_actions.size())
         state->get_legal_actions();
+
+    if(p.use_move_ordering){
+        const TTEntry* e = p.use_tt ? g_tt.probe(state->hash()) : nullptr;
+        Move tt_move{};
+        bool has_tt_move = false;
+        if(e && e->has_move){ tt_move = e->best_move; has_tt_move = true; }
+        order_moves(state->legal_actions, state, tt_move, has_tt_move,
+                     g_killers, 0, g_history);
+    }
 
     int best_score  = M_MAX - 10;
     int alpha       = M_MAX;
@@ -196,7 +267,6 @@ SearchResult PVS::search(
             score = same ? raw : -raw;
             first_move = false;
         } else {
-            // Null window
             int null_alpha = same ? alpha : -(alpha + 1);
             int null_beta  = same ? (alpha + 1) : -alpha;
             int raw = eval_ctx(next, depth - 1,
@@ -244,6 +314,8 @@ ParamMap PVS::default_params(){
         {"UseEvalMobility", "true"},
         {"UseQuiescence",   "true"},
         {"ReportPartial",   "true"},
+        {"UseTT",            "true"},
+        {"UseMoveOrdering",  "true"},
     };
 }
 
@@ -253,5 +325,7 @@ std::vector<ParamDef> PVS::param_defs(){
         {"UseEvalMobility", ParamDef::CHECK, "true"},
         {"UseQuiescence",   ParamDef::CHECK, "true"},
         {"ReportPartial",   ParamDef::CHECK, "true"},
+        {"UseTT",           ParamDef::CHECK, "true"},
+        {"UseMoveOrdering", ParamDef::CHECK, "true"},
     };
 }
