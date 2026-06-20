@@ -9,6 +9,9 @@ struct PVSParams {
     bool report_partial    = true;
     bool use_tt            = true;
     bool use_move_ordering = true;
+    bool use_null_move     = true;
+    bool use_lmr           = true;
+    bool use_futility      = true;
 
     static PVSParams from_map(const ParamMap& m){
         PVSParams p;
@@ -18,6 +21,9 @@ struct PVSParams {
         p.report_partial    = param_bool(m, "ReportPartial",   true);
         p.use_tt            = param_bool(m, "UseTT",           true);
         p.use_move_ordering = param_bool(m, "UseMoveOrdering", true);
+        p.use_null_move     = param_bool(m, "UseNullMove",     true);
+        p.use_lmr           = param_bool(m, "UseLMR",          true);
+        p.use_futility      = param_bool(m, "UseFutility",     true);
         return p;
     }
 };
@@ -32,7 +38,8 @@ public:
         GameHistory& history,
         int ply,
         SearchContext& ctx,
-        const PVSParams& p
+        const PVSParams& p,
+        bool allow_null = true
     );
 
     static int quiescence(

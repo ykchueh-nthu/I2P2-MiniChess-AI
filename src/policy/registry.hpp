@@ -72,4 +72,4 @@ inline const AlgoEntry* find_algo(const std::string& name){
     return nullptr;
 }
 
-inline std::string default_algo_name(){ return "minimax"; }
+inline std::string default_algo_name(){ return "pvs"; }

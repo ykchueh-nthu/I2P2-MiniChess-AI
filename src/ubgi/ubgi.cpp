@@ -278,6 +278,12 @@ static void do_search(
     state.step = step;
     state.get_legal_actions();
 
+    /* Pass the time budget to the algorithm so it can self-abort mid-depth */
+    if(movetime_ms > 0){
+        /* Use 90% of the allotted time; the remaining 10% is margin for I/O */
+        ctx.params["SearchTimeLimitMs"] = std::to_string((movetime_ms * 9) / 10);
+    }
+
     auto alive = [&](){
         if(my_gen != g_search_gen.load()){
             return false;
@@ -455,7 +461,9 @@ static void do_search(
         if(!alive()){
             break;
         }
-        if(movetime_ms > 0 && total_ms * 2 >= movetime_ms){
+        /* Allow starting a new depth if we've used less than 70% of the time;
+         * the internal SearchTimeLimitMs safety net will abort mid-depth if needed */
+        if(movetime_ms > 0 && total_ms * 10 >= movetime_ms * 7){
             break;
         }
         if(result.score >= P_MAX - 100 || result.score <= M_MAX + 100){
